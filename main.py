@@ -152,7 +152,9 @@ def fetch_and_detect():
 
     # Get cached MAs
     mas = get_cached_mas()
-    ema_20 = mas.get("ema_20") if mas else None
+if mas:
+    store.last_mas = mas
+ema_20 = mas.get("ema_20") if mas else None
 
     # Get instrument + bias
     instrument = get_today_instrument()
