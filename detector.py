@@ -1,9 +1,22 @@
 # detector.py — Complete pattern detection engine
-
+# FIXES APPLIED:
+# 1. Double/Triple Top+Bottom: only fires at 12:00 PM window + multi-timeframe confirmation
+# 2. All other patterns: 15-min cooldown via existing store.can_alert() (unchanged)
+ 
 from config import *
 from store import store
 from datetime import datetime
-
+ 
+IST_DOUBLE_TOP_WINDOW_START = (11, 55)  # 11:55 AM
+IST_DOUBLE_TOP_WINDOW_END   = (12, 10)  # 12:10 PM
+ 
+# ─── Time window check ──────────────────────────────────────────────────────
+def is_noon_window():
+    """Returns True only between 11:55 AM and 12:10 PM IST"""
+    now = datetime.now()
+    current = (now.hour, now.minute)
+    return IST_DOUBLE_TOP_WINDOW_START <= current <= IST_DOUBLE_TOP_WINDOW_END
+ 
 # ─── Local extrema helpers ──────────────────────────────────────────────────
 def find_local_maxima(values, min_gap=3):
     peaks = []
@@ -12,7 +25,7 @@ def find_local_maxima(values, min_gap=3):
            all(values[i] >= values[i+j] for j in range(1, min_gap+1)):
             peaks.append((i, values[i]))
     return peaks
-
+ 
 def find_local_minima(values, min_gap=3):
     troughs = []
     for i in range(min_gap, len(values) - min_gap):
@@ -20,9 +33,106 @@ def find_local_minima(values, min_gap=3):
            all(values[i] <= values[i+j] for j in range(1, min_gap+1)):
             troughs.append((i, values[i]))
     return troughs
-
-# ─── Double Top / Bottom ────────────────────────────────────────────────────
+ 
+# ─── Multi-timeframe confirmation ───────────────────────────────────────────
+def check_multi_timeframe_double_top():
+    """
+    Check double top on hourly, daily, weekly, monthly candles.
+    Returns True only if pattern confirmed on 2+ timeframes simultaneously.
+    Uses intraday store data to approximate timeframes.
+    """
+    highs = store.get_highs()
+    if len(highs) < 10:
+        return False, []
+ 
+    confirmed_timeframes = []
+ 
+    # Hourly: use last 30 candles (30 x 2min = 60min)
+    hourly_highs = highs[-30:] if len(highs) >= 30 else highs
+    peaks_h = find_local_maxima(hourly_highs, min_gap=3)
+    if len(peaks_h) >= 2:
+        p1, p2 = peaks_h[-2][1], peaks_h[-1][1]
+        if abs(p1 - p2) / p1 <= DOUBLE_TOP_TOLERANCE:
+            confirmed_timeframes.append("Hourly")
+ 
+    # Daily: use all candles today (up to 150 candles)
+    daily_highs = highs
+    peaks_d = find_local_maxima(daily_highs, min_gap=5)
+    if len(peaks_d) >= 2:
+        p1, p2 = peaks_d[-2][1], peaks_d[-1][1]
+        if abs(p1 - p2) / p1 <= DOUBLE_TOP_TOLERANCE * 1.5:
+            confirmed_timeframes.append("Daily")
+ 
+    # Weekly/Monthly: use store.last_mas which contains historical context
+    # We approximate using the day's high vs previous session context
+    last_mas = store.last_mas
+    weekly_high = last_mas.get("weekly_high", 0)
+    monthly_high = last_mas.get("monthly_high", 0)
+    current_high = max(highs) if highs else 0
+ 
+    if weekly_high and abs(current_high - weekly_high) / weekly_high <= DOUBLE_TOP_TOLERANCE * 2:
+        confirmed_timeframes.append("Weekly")
+ 
+    if monthly_high and abs(current_high - monthly_high) / monthly_high <= DOUBLE_TOP_TOLERANCE * 3:
+        confirmed_timeframes.append("Monthly")
+ 
+    # Require at least 2 timeframes
+    return len(confirmed_timeframes) >= 2, confirmed_timeframes
+ 
+ 
+def check_multi_timeframe_double_bottom():
+    """
+    Check double bottom on hourly, daily, weekly, monthly candles.
+    Returns True only if pattern confirmed on 2+ timeframes simultaneously.
+    """
+    lows = store.get_lows()
+    if len(lows) < 10:
+        return False, []
+ 
+    confirmed_timeframes = []
+ 
+    # Hourly: last 30 candles
+    hourly_lows = lows[-30:] if len(lows) >= 30 else lows
+    troughs_h = find_local_minima(hourly_lows, min_gap=3)
+    if len(troughs_h) >= 2:
+        t1, t2 = troughs_h[-2][1], troughs_h[-1][1]
+        if abs(t1 - t2) / t1 <= DOUBLE_BOTTOM_TOLERANCE:
+            confirmed_timeframes.append("Hourly")
+ 
+    # Daily: all candles
+    daily_lows = lows
+    troughs_d = find_local_minima(daily_lows, min_gap=5)
+    if len(troughs_d) >= 2:
+        t1, t2 = troughs_d[-2][1], troughs_d[-1][1]
+        if abs(t1 - t2) / t1 <= DOUBLE_BOTTOM_TOLERANCE * 1.5:
+            confirmed_timeframes.append("Daily")
+ 
+    # Weekly/Monthly via store.last_mas
+    last_mas = store.last_mas
+    weekly_low = last_mas.get("weekly_low", 0)
+    monthly_low = last_mas.get("monthly_low", 0)
+    current_low = min(lows) if lows else 0
+ 
+    if weekly_low and abs(current_low - weekly_low) / weekly_low <= DOUBLE_BOTTOM_TOLERANCE * 2:
+        confirmed_timeframes.append("Weekly")
+ 
+    if monthly_low and abs(current_low - monthly_low) / monthly_low <= DOUBLE_BOTTOM_TOLERANCE * 3:
+        confirmed_timeframes.append("Monthly")
+ 
+    return len(confirmed_timeframes) >= 2, confirmed_timeframes
+ 
+ 
+# ─── Double Top / Bottom (FIXED — noon window + multi-timeframe) ────────────
 def check_double_top(highs):
+    # RULE: Only fire between 11:55 AM and 12:10 PM
+    if not is_noon_window():
+        return None
+ 
+    # RULE: Multi-timeframe confirmation required
+    confirmed, timeframes = check_multi_timeframe_double_top()
+    if not confirmed:
+        return None
+ 
     peaks = find_local_maxima(highs)
     if len(peaks) < 2:
         return None
@@ -33,12 +143,22 @@ def check_double_top(highs):
         return {
             "pattern": "Double Top 🔴",
             "level": round((p1_val + p2_val) / 2, 2),
-            "detail": f"Top 1: {round(p1_val,2)} | Top 2: {round(p2_val,2)}",
-            "action": "⚠️ Evaluate PE trade — sell on rally"
+            "detail": f"Top 1: {round(p1_val,2)} | Top 2: {round(p2_val,2)} | Confirmed: {', '.join(timeframes)}",
+            "action": "⚠️ HIGH CONVICTION — 12:30 PM PE trade. Sell on rally."
         }
     return None
-
+ 
+ 
 def check_double_bottom(lows):
+    # RULE: Only fire between 11:55 AM and 12:10 PM
+    if not is_noon_window():
+        return None
+ 
+    # RULE: Multi-timeframe confirmation required
+    confirmed, timeframes = check_multi_timeframe_double_bottom()
+    if not confirmed:
+        return None
+ 
     troughs = find_local_minima(lows)
     if len(troughs) < 2:
         return None
@@ -49,13 +169,16 @@ def check_double_bottom(lows):
         return {
             "pattern": "Double Bottom 🟢",
             "level": round((t1_val + t2_val) / 2, 2),
-            "detail": f"Bottom 1: {round(t1_val,2)} | Bottom 2: {round(t2_val,2)}",
-            "action": "⚠️ Evaluate CE trade — buy the dip"
+            "detail": f"Bottom 1: {round(t1_val,2)} | Bottom 2: {round(t2_val,2)} | Confirmed: {', '.join(timeframes)}",
+            "action": "⚠️ HIGH CONVICTION — 12:30 PM CE trade. Buy the dip."
         }
     return None
-
-# ─── Triple Top / Bottom ────────────────────────────────────────────────────
+ 
+ 
+# ─── Triple Top / Bottom (FIXED — noon window only) ─────────────────────────
 def check_triple_top(highs):
+    if not is_noon_window():
+        return None
     peaks = find_local_maxima(highs)
     if len(peaks) < 3:
         return None
@@ -71,8 +194,11 @@ def check_triple_top(highs):
             "action": "⚠️ Strong PE signal — high conviction sell"
         }
     return None
-
+ 
+ 
 def check_triple_bottom(lows):
+    if not is_noon_window():
+        return None
     troughs = find_local_minima(lows)
     if len(troughs) < 3:
         return None
@@ -88,14 +214,12 @@ def check_triple_bottom(lows):
             "action": "⚠️ Strong CE signal — high conviction buy"
         }
     return None
-
-# ─── Stop Hunt Detection ────────────────────────────────────────────────────
+ 
+ 
+# ─── Stop Hunt Detection (unchanged) ────────────────────────────────────────
 def check_stop_hunt(lows, closes, highs):
-    """Detect stop hunt: breach of key level followed by immediate recovery"""
     if len(closes) < 3:
         return None
-
-    # Bearish stop hunt: price dips below recent low then recovers
     recent_low = min(lows[-6:-1]) if len(lows) > 6 else min(lows[:-1])
     if lows[-1] < recent_low and closes[-1] > recent_low:
         return {
@@ -104,8 +228,6 @@ def check_stop_hunt(lows, closes, highs):
             "detail": f"Dipped to {round(lows[-1],2)}, recovering above {round(recent_low,2)}",
             "action": "⚠️ Potential mean reversion UP — evaluate CE"
         }
-
-    # Bullish stop hunt: price spikes above recent high then reverses
     recent_high = max(highs[-6:-1]) if len(highs) > 6 else max(highs[:-1])
     if highs[-1] > recent_high and closes[-1] < recent_high:
         return {
@@ -115,10 +237,10 @@ def check_stop_hunt(lows, closes, highs):
             "action": "⚠️ Potential mean reversion DOWN — evaluate PE"
         }
     return None
-
-# ─── Max Pain Gap Detection ─────────────────────────────────────────────────
+ 
+ 
+# ─── Max Pain Gap Detection (unchanged) ─────────────────────────────────────
 def check_max_pain_gap(current_price, max_pain):
-    """Alert when price is 200+ pts from max pain"""
     if not max_pain:
         return None
     gap = current_price - max_pain
@@ -132,8 +254,9 @@ def check_max_pain_gap(current_price, max_pain):
             "action": f"⚠️ Fade toward max pain — evaluate {fade}"
         }
     return None
-
-# ─── Key Level Proximity ────────────────────────────────────────────────────
+ 
+ 
+# ─── Key Level Proximity (unchanged) ────────────────────────────────────────
 def check_key_levels(close):
     for level in KEY_RESISTANCE:
         if abs(close - level) <= LEVEL_PROXIMITY:
@@ -152,8 +275,9 @@ def check_key_levels(close):
                 "action": "Watch for bounce — potential CE"
             }
     return None
-
-# ─── Velocity / Sharp Move ──────────────────────────────────────────────────
+ 
+ 
+# ─── Velocity / Sharp Move (unchanged) ──────────────────────────────────────
 def check_velocity(closes):
     if len(closes) < 2:
         return None
@@ -167,8 +291,9 @@ def check_velocity(closes):
             "action": "High velocity — watch for reversal at next support/resistance"
         }
     return None
-
-# ─── Candlestick Patterns ───────────────────────────────────────────────────
+ 
+ 
+# ─── Candlestick Patterns (unchanged) ───────────────────────────────────────
 def check_hammer(candles_list):
     if not candles_list:
         return None
@@ -193,7 +318,8 @@ def check_hammer(candles_list):
             "action": "Bearish reversal signal — evaluate PE"
         }
     return None
-
+ 
+ 
 def check_engulfing(candles_list):
     if len(candles_list) < 2:
         return None
@@ -203,7 +329,6 @@ def check_engulfing(candles_list):
     curr_body = abs(curr.close - curr.open)
     if prev_body == 0 or curr_body == 0:
         return None
-    # Bullish engulfing
     if (prev.close < prev.open and curr.close > curr.open and
             curr.open <= prev.close and curr.close >= prev.open and
             curr_body > prev_body):
@@ -213,7 +338,6 @@ def check_engulfing(candles_list):
             "detail": f"Green candle engulfs previous red — {round(curr_body,1)} pt body",
             "action": "Strong bullish reversal — evaluate CE"
         }
-    # Bearish engulfing
     if (prev.close > prev.open and curr.close < curr.open and
             curr.open >= prev.close and curr.close <= prev.open and
             curr_body > prev_body):
@@ -224,7 +348,8 @@ def check_engulfing(candles_list):
             "action": "Strong bearish reversal — evaluate PE"
         }
     return None
-
+ 
+ 
 def check_doji(candles_list):
     if not candles_list:
         return None
@@ -239,13 +364,12 @@ def check_doji(candles_list):
             "action": "Wait for next candle direction — do not trade yet"
         }
     return None
-
+ 
+ 
 def check_morning_evening_star(candles_list):
-    """3-candle reversal patterns"""
     if len(candles_list) < 3:
         return None
     c1, c2, c3 = candles_list[-3], candles_list[-2], candles_list[-1]
-    # Morning Star: red, small body, green
     if (c1.close < c1.open and
             abs(c2.close - c2.open) < abs(c1.close - c1.open) * 0.3 and
             c3.close > c3.open and c3.close > (c1.open + c1.close) / 2):
@@ -255,7 +379,6 @@ def check_morning_evening_star(candles_list):
             "detail": "3-candle bullish reversal pattern",
             "action": "Strong bullish signal — evaluate CE"
         }
-    # Evening Star: green, small body, red
     if (c1.close > c1.open and
             abs(c2.close - c2.open) < abs(c1.close - c1.open) * 0.3 and
             c3.close < c3.open and c3.close < (c1.open + c1.close) / 2):
@@ -266,10 +389,10 @@ def check_morning_evening_star(candles_list):
             "action": "Strong bearish signal — evaluate PE"
         }
     return None
-
-# ─── Narrow Range Day Detection ─────────────────────────────────────────────
+ 
+ 
+# ─── Narrow Range Day Detection (unchanged) ─────────────────────────────────
 def check_narrow_range(highs, lows, vix):
-    """Skip day signal: VIX < 14 + small range"""
     if len(highs) < 5 or len(lows) < 5:
         return None
     day_range = max(highs) - min(lows)
@@ -281,10 +404,10 @@ def check_narrow_range(highs, lows, vix):
             "action": "SKIP TRADING TODAY — insufficient range for meaningful R/R"
         }
     return None
-
-# ─── MA Cross ───────────────────────────────────────────────────────────────
+ 
+ 
+# ─── MA Cross (unchanged) ───────────────────────────────────────────────────
 def check_ma_cross_intraday(closes, ema_20):
-    """Alert when intraday price crosses 20 EMA"""
     if not ema_20 or len(closes) < 2:
         return None
     prev = closes[-2]
@@ -304,11 +427,11 @@ def check_ma_cross_intraday(closes, ema_20):
             "action": "Bearish momentum — evaluate PE"
         }
     return None
-
-# ─── Weekly Bias Check ──────────────────────────────────────────────────────
+ 
+ 
+# ─── Weekly Bias Check (unchanged) ──────────────────────────────────────────
 def get_weekly_bias():
-    """Mon/Wed = put writers (green). Tue/Thu = call writers (red). Fri = neutral"""
-    day = datetime.now().weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri
+    day = datetime.now().weekday()
     bias_map = {
         0: ("PUT WRITERS DAY 🟢", "Monday — green bias. Buy dips. Double dip = CE entry."),
         1: ("CALL WRITERS DAY 🔴", "Tuesday — NIFTY EXPIRY. Red bias after 10:30 AM. Double top = PE entry."),
@@ -317,19 +440,20 @@ def get_weekly_bias():
         4: ("NEUTRAL ⚪", "Friday — no expiry. Trade only high conviction setups.")
     }
     return bias_map.get(day, ("UNKNOWN", ""))
-
-# ─── Master detector ────────────────────────────────────────────────────────
+ 
+ 
+# ─── Master detector (unchanged) ────────────────────────────────────────────
 def run_all_checks(max_pain=0, ema_20=None):
     if store.count() < 5:
         return []
-
+ 
     detected = []
-    closes = store.get_closes()
-    highs  = store.get_highs()
-    lows   = store.get_lows()
+    closes  = store.get_closes()
+    highs   = store.get_highs()
+    lows    = store.get_lows()
     candles = list(store.candles)
     latest  = store.latest()
-
+ 
     checks = [
         check_double_top(highs),
         check_double_bottom(lows),
@@ -346,9 +470,10 @@ def run_all_checks(max_pain=0, ema_20=None):
         check_narrow_range(highs, lows, latest.vix),
         check_ma_cross_intraday(closes, ema_20) if ema_20 else None,
     ]
-
+ 
     for result in checks:
         if result:
             detected.append(result)
-
+ 
     return detected
+ 
