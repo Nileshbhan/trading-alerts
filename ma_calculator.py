@@ -1,82 +1,140 @@
-# ma_calculator.py — Auto-compute MAs from NSE daily OHLC
 
-from fetcher import fetch_nifty_daily_history
-
-def compute_sma(closes, period):
-    """Simple Moving Average"""
-    if len(closes) < period:
-        return None
-    return round(sum(closes[-period:]) / period, 2)
-
-def compute_ema(closes, period):
-    """Exponential Moving Average"""
-    if len(closes) < period:
+# ma_calculator.py — FIXED
+# Added: weekly_high, weekly_low, monthly_high, monthly_low for multi-timeframe detection
+# Added: MA proximity alert support
+ 
+import requests
+from datetime import datetime, timedelta
+import pytz
+ 
+IST = pytz.timezone("Asia/Kolkata")
+ 
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+    "Referer": "https://www.nseindia.com"
+}
+ 
+def fetch_nse_historical(symbol="NIFTY 50", days=250):
+    """Fetch historical daily OHLC from NSE"""
+    try:
+        end = datetime.now(IST)
+        start = end - timedelta(days=days)
+        url = (f"https://www.nseindia.com/api/historical/indicesHistory"
+               f"?indexType={symbol}"
+               f"&from={start.strftime('%d-%m-%Y')}"
+               f"&to={end.strftime('%d-%m-%Y')}")
+        session = requests.Session()
+        session.get("https://www.nseindia.com", headers=NSE_HEADERS, timeout=10)
+        r = session.get(url, headers=NSE_HEADERS, timeout=10)
+        data = r.json()
+        closes = [float(d["CLOSE"]) for d in data["data"]["indexCloseOnlineRecords"]]
+        highs  = [float(d["EOD_HIGH_INDEX_VAL"]) for d in data["data"]["indexCloseOnlineRecords"]]
+        lows   = [float(d["EOD_LOW_INDEX_VAL"])  for d in data["data"]["indexCloseOnlineRecords"]]
+        return closes, highs, lows
+    except Exception as e:
+        print(f"NSE historical fetch error: {e}")
+        return [], [], []
+ 
+def calculate_ema(values, period):
+    if len(values) < period:
         return None
     k = 2 / (period + 1)
-    ema = sum(closes[:period]) / period  # Seed with SMA
-    for price in closes[period:]:
-        ema = price * k + ema * (1 - k)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
     return round(ema, 2)
-
-def get_all_mas():
-    """Fetch history and compute all MAs"""
-    closes = fetch_nifty_daily_history(days=250)
-    if not closes:
+ 
+def calculate_sma(values, period):
+    if len(values) < period:
         return None
-
-    return {
-        "ema_20":  compute_ema(closes, 20),
-        "ema_50":  compute_ema(closes, 50),
-        "sma_200": compute_sma(closes, 200),
-        "last_close": closes[-1] if closes else 0,
-        "data_points": len(closes)
+    return round(sum(values[-period:]) / period, 2)
+ 
+def get_all_mas():
+    """
+    Compute all MAs + weekly/monthly high/low for multi-timeframe detection.
+    Returns dict with ema_20, ema_50, sma_200, weekly_high, weekly_low,
+    monthly_high, monthly_low, ma_proximity_alerts
+    """
+    closes, highs, lows = fetch_nse_historical(days=300)
+    if not closes:
+        return {}
+ 
+    ema_20  = calculate_ema(closes, 20)
+    ema_50  = calculate_ema(closes, 50)
+    sma_200 = calculate_sma(closes, 200)
+ 
+    # Weekly = last 5 trading days
+    weekly_high  = max(highs[-5:])  if len(highs) >= 5  else None
+    weekly_low   = min(lows[-5:])   if len(lows)  >= 5  else None
+ 
+    # Monthly = last 22 trading days
+    monthly_high = max(highs[-22:]) if len(highs) >= 22 else None
+    monthly_low  = min(lows[-22:])  if len(lows)  >= 22 else None
+ 
+    current_price = closes[-1] if closes else 0
+ 
+    # Proximity alerts — within 75 pts of any key MA
+    proximity_alerts = []
+    ma_levels = {
+        "20 EMA": ema_20,
+        "50 EMA": ema_50,
+        "200 SMA": sma_200
     }
-
+    for name, level in ma_levels.items():
+        if level and abs(current_price - level) <= 75:
+            direction = "above" if current_price > level else "below"
+            gap = round(abs(current_price - level), 0)
+            proximity_alerts.append(
+                f"⚡ {name} at {level} — price {gap} pts {direction}"
+            )
+ 
+    return {
+        "ema_20":          ema_20,
+        "ema_50":          ema_50,
+        "sma_200":         sma_200,
+        "weekly_high":     round(weekly_high,  2) if weekly_high  else None,
+        "weekly_low":      round(weekly_low,   2) if weekly_low   else None,
+        "monthly_high":    round(monthly_high, 2) if monthly_high else None,
+        "monthly_low":     round(monthly_low,  2) if monthly_low  else None,
+        "proximity_alerts": proximity_alerts
+    }
+ 
 def interpret_mas(mas, current_price):
-    """Generate bias from MA positions"""
+    """Human-readable MA summary for morning brief"""
     if not mas:
         return "MA data unavailable"
-
-    signals = []
-    if mas["ema_20"] and current_price > mas["ema_20"]:
-        signals.append("✅ Above 20 EMA")
-    elif mas["ema_20"]:
-        signals.append("❌ Below 20 EMA")
-
-    if mas["ema_50"] and current_price > mas["ema_50"]:
-        signals.append("✅ Above 50 EMA")
-    elif mas["ema_50"]:
-        signals.append("❌ Below 50 EMA")
-
-    if mas["sma_200"] and current_price > mas["sma_200"]:
-        signals.append("✅ Above 200 SMA")
-    elif mas["sma_200"]:
-        signals.append("❌ Below 200 SMA")
-
-    bullish = sum(1 for s in signals if "✅" in s)
-    if bullish == 3:
-        bias = "BULLISH — above all MAs"
-    elif bullish == 2:
-        bias = "MILDLY BULLISH"
-    elif bullish == 1:
-        bias = "MILDLY BEARISH"
-    else:
-        bias = "BEARISH — below all MAs"
-
-    return {"signals": signals, "bias": bias}
-
-def check_ma_cross(mas, current_price, prev_price):
-    """Alert if price just crossed a key MA"""
-    if not mas:
-        return None
-    crosses = []
-    for label, ma_val in [("20 EMA", mas["ema_20"]),
-                           ("50 EMA", mas["ema_50"]),
-                           ("200 SMA", mas["sma_200"])]:
-        if not ma_val:
-            continue
-        if prev_price < ma_val <= current_price:
-            crosses.append(f"🟢 Price crossed ABOVE {label} at {ma_val}")
-        elif prev_price > ma_val >= current_price:
-            crosses.append(f"🔴 Price crossed BELOW {label} at {ma_val}")
-    return crosses if crosses else None
+ 
+    ema_20  = mas.get("ema_20")
+    ema_50  = mas.get("ema_50")
+    sma_200 = mas.get("sma_200")
+    alerts  = mas.get("proximity_alerts", [])
+ 
+    lines = ["📊 *Key MA Levels:*"]
+    if ema_20:
+        rel = "above ✅" if current_price > ema_20 else "below ⚠️"
+        lines.append(f"  20 EMA:  {ema_20}  — price {rel}")
+    if ema_50:
+        rel = "above ✅" if current_price > ema_50 else "below ⚠️"
+        lines.append(f"  50 EMA:  {ema_50}  — price {rel}")
+    if sma_200:
+        rel = "above ✅" if current_price > sma_200 else "below ⚠️"
+        lines.append(f"  200 SMA: {sma_200} — price {rel}")
+ 
+    w_high = mas.get("weekly_high")
+    w_low  = mas.get("weekly_low")
+    m_high = mas.get("monthly_high")
+    m_low  = mas.get("monthly_low")
+ 
+    if w_high and w_low:
+        lines.append(f"  Weekly range: {w_low} — {w_high}")
+    if m_high and m_low:
+        lines.append(f"  Monthly range: {m_low} — {m_high}")
+ 
+    if alerts:
+        lines.append("\n⚡ *Proximity Alerts:*")
+        for a in alerts:
+            lines.append(f"  {a}")
+ 
+    return "\n".join(lines)
+ 
